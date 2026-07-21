@@ -1,0 +1,40 @@
+# Predeclared benchmark matrix — committed BEFORE any kernel tuning (project rule).
+# Adding cases later is allowed; removing or narrowing cases is not.
+# Timing: triton.testing.do_bench, warmup >= 25ms, >= 100 measured iters,
+# report median + IQR; raw replicates stored as JSON in bench/results/.
+# torch.compile compilation time reported separately from steady state.
+# Unsupported/failed configs are recorded with status: "failed"/"unsupported", never omitted.
+
+rmsnorm:
+  providers: [kiln, eager, torch_compile, liger]
+  core:
+    dtypes: [float16, bfloat16]
+    # M = batch*seq rows, N = hidden size
+    M: [1, 16, 256, 4096, 16384]
+    N: [1024, 4096, 8192]
+    modes: [fwd, fwd_bwd]
+  stress:
+    - {dtype: float16, M: 2048, N: 3000, modes: [fwd, fwd_bwd]}   # non-power-of-2 hidden
+    - {dtype: float16, M: 2048, N: 8191, modes: [fwd, fwd_bwd]}   # pow2-1 masking worst case
+    - {dtype: float32, M: 4096, N: 4096, modes: [fwd, fwd_bwd]}
+    - {dtype: float16, M: 1,    N: 8192, modes: [fwd]}            # latency floor
+    - {dtype: float16, M: 65536, N: 1024, modes: [fwd]}           # many small rows
+
+sampling:
+  providers: [kiln, eager_hf_chain, torch_compile_hf_chain, vllm_sampler]
+  # vllm_sampler is expected to be unavailable on this machine; it must appear in
+  # results marked "unsupported" rather than silently dropped.
+  core:
+    dtype: float16
+    temperature: 0.8
+    B: [1, 32, 256]
+    V: [32768, 131072]
+    k: [1, 50, 500]
+    p: [0.9, 1.0]
+  stress:
+    - {dtype: float32, B: 256, V: 131072, k: 500, p: 0.9, temperature: 0.8}
+    - {dtype: float16, B: 8,   V: 131072, k: 50,  p: 0.9, temperature: 0.8}
+    - {dtype: float16, B: 128, V: 32768,  k: 50,  p: 0.9, temperature: 0.8}
+    - {dtype: float16, B: 32,  V: 1024,   k: 50,  p: 0.9, temperature: 0.8}   # tiny vocab
+    - {dtype: float16, B: 32,  V: 131072, k: 131072, p: 1.0, temperature: 1.0} # no-op filters (softmax floor)
+    - {dtype: float16, B: 32,  V: 131072, k: 1,   p: 0.9, temperature: 0.05}  # extreme temperature

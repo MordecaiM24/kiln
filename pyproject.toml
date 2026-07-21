@@ -1,0 +1,24 @@
+[project]
+name = "kiln"
+version = "0.1.0"
+description = "Small, rigorous Triton kernels: RMSNorm (fwd+bwd) and fused top-k/top-p sampling, benchmarked honestly."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.5.1",
+    "torch>=2.13.0",
+    "pytest>=9.0",
+    "pyyaml>=6.0",
+    "matplotlib>=3.9",
+    "liger-kernel>=0.5",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kiln"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
