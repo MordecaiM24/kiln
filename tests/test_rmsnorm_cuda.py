@@ -1,3 +1,5 @@
+import os
+
 import pytest
 import torch
 
@@ -13,10 +15,13 @@ from test_rmsnorm import (
 )
 
 
-try:
-    from kiln.rmsnorm_cuda import MAX_FUSED_N, rmsnorm_cuda
-except Exception as exc:  # CUDA/nvcc are intentionally unavailable on CPU CI and macOS.
-    pytestmark = pytest.mark.skip(reason=f"CUDA extension unavailable: {exc}")
+if os.getenv("KILN_SKIP_CUDA_TESTS") == "1":
+    pytestmark = pytest.mark.skip(reason="KILN_SKIP_CUDA_TESTS=1")
+else:
+    try:
+        from kiln.rmsnorm_cuda import MAX_FUSED_N, rmsnorm_cuda
+    except Exception as exc:  # CUDA/nvcc are intentionally unavailable on CPU CI and macOS.
+        pytestmark = pytest.mark.skip(reason=f"CUDA extension unavailable: {exc}")
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -93,6 +98,32 @@ def test_too_large_hidden_size_raises():
     weight = torch.empty((MAX_FUSED_N + 1,), device="cuda")
     with pytest.raises(ValueError, match="exceeds MAX_FUSED_N"):
         rmsnorm_cuda(x, weight, EPS)
+
+
+def test_zero_rows():
+    x = torch.empty((0, 257), device="cuda", dtype=torch.float16, requires_grad=True)
+    weight = torch.randn((257,), device="cuda", dtype=torch.float16, requires_grad=True)
+    y = rmsnorm_cuda(x, weight, EPS)
+    assert y.shape == x.shape
+    y.backward(torch.empty_like(y))
+    assert x.grad.shape == x.shape
+    assert torch.equal(weight.grad, torch.zeros_like(weight))
+
+
+def test_misaligned_even_width_scalar_fallback():
+    # A contiguous view may still begin at a two-byte offset; half2 is forbidden there.
+    m, n = 3, 1000
+    x_storage = torch.randn(m * n + 1, device="cuda", dtype=torch.float16)
+    w_storage = torch.randn(n + 1, device="cuda", dtype=torch.float16)
+    x = x_storage[1:].view(m, n).requires_grad_(True)
+    weight = w_storage[1:].requires_grad_(True)
+    grad = torch.randn_like(x)
+    y_ref, dx_ref, dw_ref = _reference(x, weight, grad)
+    y = rmsnorm_cuda(x, weight, EPS)
+    y.backward(grad)
+    _assert_close(y, y_ref, torch.float16, FWD_TOL)
+    _assert_close(x.grad, dx_ref, torch.float16, BWD_TOL)
+    _assert_close(weight.grad, dw_ref, torch.float16, BWD_TOL)
 
 
 @pytest.mark.parametrize("m", (1, 4097))

@@ -11,6 +11,7 @@ dependencies = [
     "pyyaml>=6.0",
     "matplotlib>=3.9",
     "liger-kernel>=0.5",
+    "ninja>=1.11",
 ]
 
 [build-system]

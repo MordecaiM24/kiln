@@ -511,6 +511,26 @@ def run_sampling_provider(provider, case, device):
     return record
 
 
+def _warm_process_state(device):
+    """Best-effort state normalization before any timing.
+
+    Large memory-bound kernels show a reproducible bimodality under do_bench
+    (~104 vs ~71 us for a 4096x4096 fp16 RMSNorm) that follows the process's
+    allocation history, not the kernel: interleaved A/B runs put kiln and
+    Liger RMSNorm fwd at parity in BOTH modes, while this harness's fixed
+    per-case provider order can land different providers in different modes.
+    This warmup did NOT eliminate the artifact (see prof/notes.md,
+    "provider-order bias"); it is kept for uniformity, and cross-provider fwd
+    conclusions at bandwidth-bound shapes are drawn from interleaved A/B runs
+    rather than from single-order harness records.
+    """
+    torch._dynamo.reset()
+    f = torch.compile(lambda t: t * 2.0 + 1.0, fullgraph=True)
+    t = torch.randn(1024, device=device)
+    f(t)
+    torch.cuda.synchronize()
+
+
 def run_suite(suite_name, cases, providers, device):
     runner = run_rmsnorm_provider if suite_name == "rmsnorm" else run_sampling_provider
     records = []
@@ -537,6 +557,7 @@ def main():
         raise SystemExit("CUDA required for benchmarks")
 
     device = torch.device("cuda")
+    _warm_process_state(device)
     config = load_cases()
     args.outdir.mkdir(parents=True, exist_ok=True)
     env = collect_env()

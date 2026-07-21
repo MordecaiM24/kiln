@@ -73,6 +73,66 @@ Entries below get filled in from ncu evidence, not vibes.
   primitive would likely make multi-pivot win for fp16 too. Noted as backlog,
   not pursued.
 
+## Iteration 2 — exact keyspace histogram for small-batch fp16/bf16 (kept)
+
+- Hypothesis: at small B the sweep kernel is occupancy-starved (1 program/row);
+  an exact 65,536-bin histogram over the 16-bit sortable keyspace parallelizes
+  within the row (B*S programs) and replaces the serial searches with two tiny
+  suffix scans.
+- Key trick (better than the planned weighted histogram): every 16-bit bin is
+  ONE exact dtype value, so bin mass = count[bin] * exp(decode(bin)/T - s_max).
+  Counts use int32 atomics (exactly commutative → deterministic); there are no
+  fp32 atomics anywhere. A literal slice-private weighted-mass histogram was
+  built first and measured 2.7x SLOWER than sweep (1.49 ms) — recorded below.
+- Results (quiet GPU, do_bench, medians): B=1 V=131072 p=0.9: 573 → 205 µs
+  (2.8x); B=8: 563 → 229 µs; B=32 V=131072: 579 → 320 µs after widening the
+  dispatch envelope to the measured crossover (hist wins to B~120 at V=131072,
+  first wins near V=49152, loses at V=32768). Dispatch:
+  (B<=16 and V>=49152) or (B<=64 and V>=98304), fp16/bf16 only.
+- vs baselines at B=1, V=131072, p=0.9: now 1.10x vs eager (was 0.42x) but
+  still 0.66x vs torch.compile — the honest remaining loss; the ~0.2 ms
+  keyspace-scan floor dominates at B=1.
+- All 54 property tests (27 per path) pass with unchanged tolerances.
+
+## Provider-order bias in the harness (benchmarking pitfall, documented)
+
+The committed harness records show Liger RMSNorm fwd at M=4096, N=4096 fp16 =
+69.8–70.7 µs vs kiln 104–105 µs. That gap is a measurement artifact:
+
+- Controlled interleaved A/B (3 repeats, fresh process): kiln 102.9–103.4 µs,
+  Liger 104.2–104.3 µs. **Parity.** Same at M=16384 (414.7 both).
+- In a single process, replaying the harness's provider order flips *kiln
+  itself* to 70.7 µs after the compile+liger providers have run — both kernels
+  are bimodal {~104, ~71} together, so the harness's fixed order (kiln first,
+  liger last) fabricates a 1.5x "loss".
+- The ~71 µs mode exceeds the naive read+write DRAM roofline (77.7 µs at
+  864 GB/s), consistent with the kernel window not paying the L2 write-back
+  drain under favorable buffer placement. Sustained-load clock boosting does
+  NOT reproduce the flip; a uniform compile warm-up at suite start did NOT
+  eliminate it. Mechanism (likely allocator/placement-dependent L2 behavior)
+  left as an open item — the comparison conclusions above come from the
+  interleaved A/B, and the biased raw records are preserved, not scrubbed.
+
+## RMSNorm — corrected Liger comparison (quiet-GPU A/B) and a reverted change
+
+The committed v2 bench recorded Liger fwd at M=4096, N=4096 fp16 = 70.7 µs —
+**above the DRAM roofline** for 67 MB of traffic (77.7 µs at 864 GB/s), i.e. not
+a reproducible kernel-speed number. Controlled interleaved repeats (3x, quiet
+GPU, identical do_bench protocol):
+
+- fwd: kiln 102.9–103.4 µs vs Liger 104.2–104.3 µs (M=4096); dead even at
+  M=16384. **Parity.** Isolated-launch ncu (no L2 flush) shows Liger ~10% ahead
+  (49 vs 54 µs) via higher occupancy (100% vs 75% theoretical), but that gap
+  vanishes under flushed, DRAM-bound conditions.
+- fwd+bwd: kiln 273 µs vs Liger 212 µs (M=4096), 1270 vs 1160 (M=16384) —
+  **a real 1.1–1.3x backward loss.** Liger's backward defaults to in-place dX
+  into the dY buffer and a tuned block-row scheme; ours allocates dx and does
+  the simple two-stage dw. Left as-is (Gate C; RMSNorm is the verification tier).
+
+Reverted change: num_warps 1024→512 elements/warp (motivated by the ncu
+occupancy gap). Effect on do_bench medians: none (103.4 µs before and after) —
+the kernel is DRAM-bound at these shapes. Reverted per keep-or-revert.
+
 ## Failed / rejected ideas
 
 (keep this honest — it feeds the writeup)

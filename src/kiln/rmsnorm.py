@@ -86,10 +86,7 @@ class _RMSNormFunction(torch.autograd.Function):
         y = torch.empty_like(x2d)
         rstd = torch.empty(M, dtype=torch.float32, device=x.device)
         BLOCK_N = triton.next_power_of_2(N)
-        # 512 elements/warp: ncu showed the 1024/warp config capped theoretical
-        # occupancy at 75% (128-thread blocks) while Liger's 256-thread blocks
-        # reach 100%; see prof/notes.md (RMSNorm iteration).
-        num_warps = min(max(BLOCK_N // 512, 1), 16)
+        num_warps = min(max(BLOCK_N // 1024, 1), 16)
         _rmsnorm_fwd_kernel[(M,)](
             x2d, y, weight, rstd,
             x2d.stride(0), y.stride(0),
