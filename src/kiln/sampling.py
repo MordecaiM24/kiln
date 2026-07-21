@@ -120,21 +120,38 @@ def _hist_threshold_kernel(
 ):
     row = tl.program_id(0)
     low = tl.arange(0, 256)
-    topk_bin = 0
+    block_ids = tl.arange(0, 256)
+    target_count = tl.minimum(k, V)
+
+    # Pass 1: per-256-bin block totals and global min/max nonzero bins, read
+    # as four (64, 256) tiles. This kernel was the entire ~0.2 ms floor of the
+    # histogram path when it walked 256 dependent 1 KB loads; wide independent
+    # tile loads pipeline through L2 instead.
+    hi64 = tl.arange(0, 64)
+    totals = tl.zeros((256,), tl.int32)
     min_bin = 65535
     max_bin = 0
-    target_count = tl.minimum(k, V)
-    above = 0
-    for high in range(255, -1, -1):
-        bins = high * 256 + low
-        counts = tl.load(Counts + row * 65536 + bins)
-        nonzero = counts != 0
-        min_bin = tl.minimum(min_bin, tl.min(tl.where(nonzero, bins, 65535), axis=0))
-        max_bin = tl.maximum(max_bin, tl.max(tl.where(nonzero, bins, 0), axis=0))
-        suffix = tl.cumsum(counts, axis=0, reverse=True)
-        candidate = tl.max(tl.where(above + suffix >= target_count, bins, -1), axis=0)
-        topk_bin = tl.maximum(topk_bin, candidate)
-        above += tl.sum(counts, axis=0)
+    for chunk in range(4):
+        blocks = chunk * 64 + hi64
+        bins2d = blocks[:, None] * 256 + low[None, :]
+        tile = tl.load(Counts + row * 65536 + bins2d)
+        blk = tl.sum(tile, axis=1)
+        seg = block_ids[:, None] == blocks[None, :]
+        totals += tl.sum(tl.where(seg, blk[None, :], 0), axis=1)
+        nonzero = tile != 0
+        min_bin = tl.minimum(min_bin, tl.min(tl.where(nonzero, bins2d, 65535)))
+        max_bin = tl.maximum(max_bin, tl.max(tl.where(nonzero, bins2d, 0)))
+
+    # Vectorized suffix logic: the crossing block is the largest block whose
+    # inclusive suffix count still reaches the target; re-read only that block.
+    suffix_inc = tl.cumsum(totals, axis=0, reverse=True)
+    hb = tl.max(tl.where(suffix_inc >= target_count, block_ids, 0), axis=0)
+    above_hb = tl.sum(tl.where(block_ids > hb, totals, 0), axis=0)
+    counts_hb = tl.load(Counts + row * 65536 + hb * 256 + low)
+    suffix_hb = tl.cumsum(counts_hb, axis=0, reverse=True)
+    topk_bin = tl.max(
+        tl.where(above_hb + suffix_hb >= target_count, hb * 256 + low, 0), axis=0
+    )
 
     # k >= V selects the whole row, including bins below the count crossing.
     topk_bin = tl.where(k >= V, min_bin, topk_bin)
@@ -460,16 +477,23 @@ def _sampling_path(logits, path=None):
         return "sweep"
     if path == "hist":
         return "hist"
-    # The keyspace scan has an approximately fixed cost (~0.2 ms on the L40S)
-    # while the sweep kernel's time grows with V but stays flat in B until the
-    # SMs fill. Measured crossovers (prof/subset_iter2.md): histogram loses at
-    # V=32768, first wins near V=49152 at small B, and at V=131072 wins up to
-    # B~120. The envelope below stays inside the measured region with margin.
-    if B <= 16 and V >= 49152:
-        return "hist"
-    if B <= 64 and V >= 98304:
-        return "hist"
-    return "sweep"
+    # Piecewise envelope from measured crossovers after the iteration-3 scan
+    # fix (prof/notes.md): the histogram path has a ~40 us floor and cost
+    # roughly linear in B*V, while the sweep grows with V but is flat in B
+    # until the SMs fill. Marginal-win boundaries are excluded on purpose:
+    # measured wins at (V=32768, B=64) and (V=131072, B=192) were within ~5%,
+    # so the cutoffs sit one step inside.
+    if V >= 98304:
+        b_max = 128
+    elif V >= 65536:
+        b_max = 96
+    elif V >= 32768:
+        b_max = 48
+    elif V >= 16384:
+        b_max = 32
+    else:
+        b_max = 0  # V=8192: sweep measured faster (31 vs 41 us)
+    return "hist" if B <= b_max else "sweep"
 
 
 def _hist_topk_topp(logits, out, *, k, p, temperature):

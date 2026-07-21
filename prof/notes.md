@@ -94,6 +94,30 @@ Entries below get filled in from ncu evidence, not vibes.
   keyspace-scan floor dominates at B=1.
 - All 54 property tests (27 per path) pass with unchanged tolerances.
 
+## Iteration 3 — the histogram path's scan floor (kept; two stages)
+
+- Evidence: per-kernel ncu on the hist path at B=1, V=131072 showed
+  `_hist_threshold_kernel` at 453 µs while every other kernel was 3–19 µs.
+  The kernel walked 256 blocks of the 65,536-bin count histogram with a
+  serial `above` accumulator — 256 dependent L2 round trips.
+- Change 3a: independent-iteration block-totals pass + vectorized suffix
+  logic (reverse cumsum over a (256,) totals vector, then one block re-read).
+  B=1 V=131072: 204 → 136 µs; threshold kernel 453 → 296 µs (ncu, cold-cache
+  replay) — still dominant: the masked accumulate still chained iterations.
+- Change 3b: read the histogram as four (64, 256) tiles instead of 256 1 KB
+  rows. B=1 V=131072: 136 → **42 µs**; p=1.0: 37.9 µs.
+- Re-measured crossovers vs sweep (fp16, k=50, p=0.9): sweep wins at V=8192
+  (31 vs 41 µs); hist wins from V=16384; boundary B rises with V (B=64
+  marginal at V=32768; B=128 clear and B=192 marginal at V=131072; B=256
+  loses at both 32k and 131k). Dispatch became the piecewise envelope in
+  `_sampling_path`, with marginal boundaries deliberately excluded.
+- Outcome vs baselines (same-process, quiet GPU): B=1 V=131072 p=0.9 is now
+  3.2x faster than torch.compile (42 vs 134 µs) — this case was a 0.25x loss
+  in v1. Across the predeclared core fp16 matrix the only remaining
+  non-wins are three p=1.0 cases at 0.95–0.97x (parity) and the k=V, p=1
+  no-op-filter stress case (0.42x vs compile: that case is a pure softmax,
+  where the baseline's single fused kernel is simply the right tool).
+
 ## Provider-order bias in the harness (benchmarking pitfall, documented)
 
 The committed harness records show Liger RMSNorm fwd at M=4096, N=4096 fp16 =

@@ -56,26 +56,27 @@ atomics, bit-identical tie semantics.
 
 | V | B | p | kiln | eager chain | torch.compile | vs eager | vs compile |
 |---:|---:|---|---:|---:|---:|---:|---:|
-| 32k | 1 | 0.9 | 126 | 148 | 121 | 1.2× | **1.0×** |
-| 32k | 32 | 0.9 | 137 | 286 | 216 | 2.1× | 1.6× |
-| 32k | 256 | 0.9 | 217 | 2,764 | 2,574 | 12.7× | 11.9× |
-| 128k | 1 | 0.9 | 204 | 224 | 134 | 1.1× | **0.66×** |
-| 128k | 32 | 0.9 | 320 | 1,023 | 737 | 3.2× | 2.3× |
-| 128k | 256 | 0.9 | 948 | 15,498 | 12,656 | **16.3×** | **13.4×** |
-| 128k | 32 | 1.0 | 316 | 229 | 151 | **0.7×** | **0.5×** |
+| 32k | 1 | 0.9 | 42 | 147 | 120 | 3.5× | 2.9× |
+| 32k | 32 | 0.9 | 83 | 287 | 217 | 3.5× | 2.6× |
+| 32k | 256 | 0.9 | 216 | 2,757 | 2,571 | 12.8× | 11.9× |
+| 128k | 1 | 0.9 | 42 | 224 | 133 | 5.3× | **3.2×** |
+| 128k | 32 | 0.9 | 159 | 1,052 | 738 | 6.6× | 4.7× |
+| 128k | 256 | 0.9 | 954 | 15,628 | 12,760 | **16.4×** | **13.4×** |
+| 128k | 32 | 1.0 | 155 | 229 | 150 | 1.5× | **0.97×** |
 
-**Where it still loses, and why (kept per protocol):**
+Across the full predeclared core fp16 matrix, kiln now wins every case against
+both baselines (1.4–16.4× vs eager) except three p=1.0 cases at 0.95–0.97×
+(parity) — and B=1/V=128k, v1's worst loss at 0.25×, is now a 3.2× win over
+`torch.compile`. **What still doesn't win, and why (kept per protocol):**
 
-- **B=1 at 128k vs torch.compile (0.66×):** the histogram path cut the old
-  one-program-per-row loss from 4× to 1.5× (573 → 204 µs), but its ~0.2 ms
-  keyspace-scan floor still exceeds a compiled `topk+sort` at batch 1.
-- **p=1.0 at 128k (0.5–0.7×):** with top-p disabled the baselines skip their
-  sort entirely — the baseline genuinely does less work (labeled per the
-  no-silent-work-differences rule).
-
-At B=256, V=128k, p=0.9 the eager chain's sort dominates (15.5 ms); kiln wins
-16.3×. The fp32 stress case (B=256, 128k, k=500) runs 4.46 ms vs 15.5 ms eager
-(3.5×; fp32 keeps the sweep path with the multi-pivot search).
+- **p=1.0 near-parity (0.95–0.97×):** with top-p disabled the baselines skip
+  their sort entirely, so both sides are close to a pure softmax (labeled per
+  the no-silent-work-differences rule).
+- **k=V, p=1.0 stress case (0.42× vs compile):** both filters are no-ops, so
+  the whole op *is* a softmax — inductor's single fused softmax kernel is
+  simply the right tool for that degenerate case.
+- **fp32** keeps the sweep path (the 65,536-bin trick is exact only for
+  16-bit dtypes): the fp32 stress case runs 4.46 ms vs 15.5 ms eager (3.5×).
 
 ## Results — RMSNorm (fp16, N=4096, µs)
 
@@ -154,9 +155,17 @@ of 16-bit sortable keys with B×32 programs (int32 atomics only), then both
 thresholds come from two tiny suffix scans, exactly, because each bin *is* one
 dtype value (per-bin mass = `count × exp(value)`; a literal weighted-histogram
 variant measured 2.7× slower than the sweep and is recorded as a failed idea).
-B=1, V=128k: 573 → 204 µs; B=32, V=128k: 579 → 320 µs. The dispatch envelope
-follows measured crossovers (wins from V≈49k at small B, up to B≈120 at
-V=128k; loses at V=32k). Both paths run the full property suite (54 tests).
+B=1, V=128k: 573 → 204 µs. Both paths run the full property suite (54 tests).
+
+**Iteration 3 (profile the new path too):** per-kernel ncu showed one kernel —
+the histogram threshold scan — at 453 µs while everything else totaled ~40 µs:
+it walked 256 blocks with a serially dependent accumulator, one L2 round trip
+per block. Restructuring it twice (independent block totals + vectorized
+reverse-cumsum suffix logic: 204 → 136 µs; then reading the histogram as four
+(64×256) tiles: 136 → **42 µs**) turned the headline case around — B=1 at 128k
+went from this project's worst loss (0.25× vs compile in v1) to a 3.2× win.
+The hist/sweep dispatch envelope was then re-measured from scratch (sweep still
+wins at V=8k and B≥~192; marginal boundaries excluded).
 
 **A benchmarking pitfall we caught instead of shipping:** the harness's fixed
 provider order produced a reproducible fake 1.5× "Liger fwd win" — large
@@ -194,8 +203,8 @@ experts, validated on the L40S in 29 s.
 
 ## Backlog (visible, deliberately not scheduled)
 
-Beat compiled `topk+sort` at B=1/128k (shrink the histogram path's scan floor:
-hierarchical/coarse-first scan); in-place backward + block-row scheme for
-RMSNorm bwd (close the real 1.17× Liger gap); root-cause the allocation-history
-timing bimodality; CUDA-port backward optimization pass; single-token decode
-attention vs FlashInfer.
+In-place backward + block-row scheme for RMSNorm bwd (close the real 1.17×
+Liger gap); root-cause the allocation-history timing bimodality; extend the
+exact-histogram idea to fp32 (two-level 16+16-bit radix); mid-batch hist/sweep
+hybrid (split rows across both paths); CUDA-port backward optimization pass;
+single-token decode attention vs FlashInfer.
