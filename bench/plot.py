@@ -144,7 +144,7 @@ def plot_sampling(records, outdir):
                     yerr=[err_lo, err_hi],
                     capsize=2,
                     hatch=hatch,
-                    **{k: v for k, v in style.items() if k != "linestyle"},
+                    **{kk: vv for kk, vv in style.items() if kk in ("color", "alpha")},
                 )
                 if status != "ok":
                     for bar in bars:
