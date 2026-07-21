@@ -6,6 +6,8 @@ boundary-tie tolerance). `hf_chain_topk_topp` is the HuggingFace-style eager cha
 used as a performance baseline only — its tie-breaking differs from the contract.
 """
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -89,6 +91,181 @@ def _sortable_key(x, NBITS: tl.constexpr):
         bits = x.to(tl.int32, bitcast=True)
         bits = tl.where((bits & 0x7FFFFFFF) == 0, 0, bits)
         return tl.where(bits < 0, bits ^ 0x7FFFFFFF, bits)
+
+
+@triton.jit
+def _hist_count_kernel(
+    X, Counts,
+    stride_x,
+    V: tl.constexpr, SLICE: tl.constexpr, BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    slice_id = tl.program_id(1)
+    offsets = tl.arange(0, BLOCK)
+    slice_start = slice_id * SLICE
+    slice_end = tl.minimum(slice_start + SLICE, V)
+    for start in range(0, SLICE, BLOCK):
+        cols = slice_start + start + offsets
+        mask = cols < slice_end
+        x = tl.load(X + row * stride_x + cols, mask=mask, other=0.0)
+        bins = _sortable_key(x, 16) + 32768
+        tl.atomic_add(Counts + row * 65536 + bins, 1, mask=mask)
+
+
+@triton.jit
+def _hist_threshold_kernel(
+    Counts, Ints, Floats,
+    V: tl.constexpr, k, inv_temp,
+    IS_BF16: tl.constexpr,
+):
+    row = tl.program_id(0)
+    low = tl.arange(0, 256)
+    topk_bin = 0
+    min_bin = 65535
+    max_bin = 0
+    target_count = tl.minimum(k, V)
+    above = 0
+    for high in range(255, -1, -1):
+        bins = high * 256 + low
+        counts = tl.load(Counts + row * 65536 + bins)
+        nonzero = counts != 0
+        min_bin = tl.minimum(min_bin, tl.min(tl.where(nonzero, bins, 65535), axis=0))
+        max_bin = tl.maximum(max_bin, tl.max(tl.where(nonzero, bins, 0), axis=0))
+        suffix = tl.cumsum(counts, axis=0, reverse=True)
+        candidate = tl.max(tl.where(above + suffix >= target_count, bins, -1), axis=0)
+        topk_bin = tl.maximum(topk_bin, candidate)
+        above += tl.sum(counts, axis=0)
+
+    # k >= V selects the whole row, including bins below the count crossing.
+    topk_bin = tl.where(k >= V, min_bin, topk_bin)
+    topk_key = topk_bin - 32768
+    max_key = max_bin - 32768
+    bits = tl.where(max_key < 0, max_key ^ 0x7FFF, max_key).to(tl.int16)
+    if IS_BF16:
+        max_value = bits.to(tl.bfloat16, bitcast=True).to(tl.float32)
+    else:
+        max_value = bits.to(tl.float16, bitcast=True).to(tl.float32)
+    tl.store(Ints + row * 4 + 0, topk_key)
+    tl.store(Ints + row * 4 + 1, max_key)
+    tl.store(Floats + row * 4 + 0, max_value * inv_temp)
+
+
+@triton.jit
+def _decode_16bit_key(key, IS_BF16: tl.constexpr):
+    bits = tl.where(key < 0, key ^ 0x7FFF, key).to(tl.int16)
+    if IS_BF16:
+        return bits.to(tl.bfloat16, bitcast=True).to(tl.float32)
+    return bits.to(tl.float16, bitcast=True).to(tl.float32)
+
+
+@triton.jit
+def _hist_coarse_mass_kernel(
+    Counts, Ints, Floats, Mass, inv_temp, IS_BF16: tl.constexpr,
+):
+    row = tl.program_id(0)
+    high = tl.program_id(1)
+    low = tl.arange(0, 256)
+    full_bin = high * 256 + low
+    key = full_bin - 32768
+    topk_key = tl.load(Ints + row * 4 + 0)
+    s_max = tl.load(Floats + row * 4 + 0)
+    counts = tl.load(Counts + row * 65536 + full_bin).to(tl.float32)
+    valid = (counts != 0.0) & (key >= topk_key)
+    value = tl.where(valid, _decode_16bit_key(key, IS_BF16), 0.0)
+    mass = tl.where(valid, counts * tl.exp(value * inv_temp - s_max), 0.0)
+    tl.store(Mass + row * 256 + high, tl.sum(mass, axis=0))
+
+
+@triton.jit
+def _hist_fine_mass_kernel(
+    Counts, Ints, Floats, Mass, inv_temp, IS_BF16: tl.constexpr,
+):
+    row = tl.program_id(0)
+    low = tl.arange(0, 256)
+    coarse = tl.load(Ints + row * 4 + 2)
+    full_bin = coarse * 256 + low
+    key = full_bin - 32768
+    topk_key = tl.load(Ints + row * 4 + 0)
+    s_max = tl.load(Floats + row * 4 + 0)
+    counts = tl.load(Counts + row * 65536 + full_bin).to(tl.float32)
+    valid = (counts != 0.0) & (key >= topk_key)
+    value = tl.where(valid, _decode_16bit_key(key, IS_BF16), 0.0)
+    mass = tl.where(valid, counts * tl.exp(value * inv_temp - s_max), 0.0)
+    tl.store(Mass + row * 256 + low, mass)
+
+
+@triton.jit
+def _hist_coarse_reduce_kernel(
+    Mass, Ints, Floats,
+    S: tl.constexpr, p,
+    P_ONE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    bins = tl.arange(0, 256)
+    masses = tl.zeros((256,), tl.float32)
+    # Explicit slice order makes the cross-program reduction deterministic.
+    for slice_id in range(S):
+        masses += tl.load(Mass + (row * S + slice_id) * 256 + bins)
+    z_k = tl.sum(masses, axis=0)
+    tl.store(Floats + row * 4 + 1, z_k)
+    if P_ONE:
+        topk_key = tl.load(Ints + row * 4 + 0)
+        tl.store(Ints + row * 4 + 3, topk_key)
+        tl.store(Floats + row * 4 + 3, z_k)
+    else:
+        suffix = tl.cumsum(masses, axis=0, reverse=True)
+        target = p * z_k
+        coarse = tl.max(tl.where(suffix >= target, bins, -1), axis=0)
+        above = tl.sum(tl.where(bins > coarse, masses, 0.0), axis=0)
+        tl.store(Ints + row * 4 + 2, coarse)
+        tl.store(Floats + row * 4 + 2, above)
+
+
+@triton.jit
+def _hist_fine_reduce_kernel(Mass, Ints, Floats, S: tl.constexpr, p):
+    row = tl.program_id(0)
+    bins = tl.arange(0, 256)
+    masses = tl.zeros((256,), tl.float32)
+    for slice_id in range(S):
+        masses += tl.load(Mass + (row * S + slice_id) * 256 + bins)
+    suffix = tl.cumsum(masses, axis=0, reverse=True)
+    z_k = tl.load(Floats + row * 4 + 1)
+    above = tl.load(Floats + row * 4 + 2)
+    target = p * z_k
+    low = tl.max(tl.where(above + suffix >= target, bins, -1), axis=0)
+    coarse = tl.load(Ints + row * 4 + 2)
+    final_key = coarse * 256 + low - 32768
+    z_final = above + tl.sum(tl.where(bins >= low, masses, 0.0), axis=0)
+    tl.store(Ints + row * 4 + 3, final_key)
+    tl.store(Floats + row * 4 + 3, z_final)
+
+
+@triton.jit
+def _hist_write_kernel(
+    X, Out, Ints, Floats,
+    stride_x, stride_out,
+    V: tl.constexpr, SLICE: tl.constexpr, BLOCK: tl.constexpr,
+    inv_temp,
+):
+    row = tl.program_id(0)
+    slice_id = tl.program_id(1)
+    slice_start = slice_id * SLICE
+    slice_end = tl.minimum(slice_start + SLICE, V)
+    final_key = tl.load(Ints + row * 4 + 3)
+    s_max = tl.load(Floats + row * 4 + 0)
+    z_final = tl.load(Floats + row * 4 + 3)
+    offsets = tl.arange(0, BLOCK)
+    for start in range(0, SLICE, BLOCK):
+        cols = slice_start + start + offsets
+        mask = cols < slice_end
+        x = tl.load(X + row * stride_x + cols, mask=mask, other=0.0)
+        key = _sortable_key(x, 16)
+        value = tl.where(
+            key >= final_key,
+            tl.exp(x.to(tl.float32) * inv_temp - s_max) / z_final,
+            0.0,
+        )
+        tl.store(Out + row * stride_out + cols, value, mask=mask)
 
 
 @triton.jit
@@ -271,6 +448,71 @@ def _sampling_kernel(
         tl.store(Out + row * stride_out + cols, value, mask=mask)
 
 
+def _sampling_path(logits, path=None):
+    """Resolve the call-time path override, retaining safe fallbacks."""
+    if path is None:
+        path = os.environ.get("KILN_SAMPLING_PATH", "auto")
+    if path not in {"auto", "sweep", "hist"}:
+        raise ValueError("KILN_SAMPLING_PATH must be one of: auto, sweep, hist")
+    B, V = logits.shape
+    hist_capable = logits.dtype != torch.float32 and V >= 8192
+    if path == "sweep" or not hist_capable:
+        return "sweep"
+    if path == "hist":
+        return "hist"
+    # The keyspace scan has an approximately fixed cost (~0.2 ms on the L40S)
+    # while the sweep kernel's time grows with V but stays flat in B until the
+    # SMs fill. Measured crossovers (prof/subset_iter2.md): histogram loses at
+    # V=32768, first wins near V=49152 at small B, and at V=131072 wins up to
+    # B~120. The envelope below stays inside the measured region with margin.
+    if B <= 16 and V >= 49152:
+        return "hist"
+    if B <= 64 and V >= 98304:
+        return "hist"
+    return "sweep"
+
+
+def _hist_topk_topp(logits, out, *, k, p, temperature):
+    B, V = logits.shape
+    S = min(triton.cdiv(V, 4096), 32)
+    slice_size = triton.cdiv(V, S)
+    io_block = min(triton.next_power_of_2(slice_size), 4096)
+    counts = torch.zeros((B, 65536), dtype=torch.int32, device=logits.device)
+    mass = torch.empty((B, 1, 256), dtype=torch.float32, device=logits.device)
+    ints = torch.empty((B, 4), dtype=torch.int32, device=logits.device)
+    floats = torch.empty((B, 4), dtype=torch.float32, device=logits.device)
+    inv_temp = 1.0 / float(temperature)
+    grid = (B, S)
+    _hist_count_kernel[grid](
+        logits, counts, logits.stride(0),
+        V=V, SLICE=slice_size, BLOCK=io_block, num_warps=8,
+    )
+    _hist_threshold_kernel[(B,)](
+        counts, ints, floats, V=V, k=k, inv_temp=inv_temp,
+        IS_BF16=logits.dtype == torch.bfloat16, num_warps=8,
+    )
+    _hist_coarse_mass_kernel[(B, 256)](
+        counts, ints, floats, mass, inv_temp=inv_temp,
+        IS_BF16=logits.dtype == torch.bfloat16, num_warps=8,
+    )
+    p_one = float(p) == 1.0
+    _hist_coarse_reduce_kernel[(B,)](
+        mass, ints, floats, S=1, p=float(p), P_ONE=p_one, num_warps=8,
+    )
+    if not p_one:
+        _hist_fine_mass_kernel[(B,)](
+            counts, ints, floats, mass, inv_temp=inv_temp,
+            IS_BF16=logits.dtype == torch.bfloat16, num_warps=8,
+        )
+        _hist_fine_reduce_kernel[(B,)](
+            mass, ints, floats, S=1, p=float(p), num_warps=8,
+        )
+    _hist_write_kernel[grid](
+        logits, out, ints, floats, logits.stride(0), out.stride(0),
+        V=V, SLICE=slice_size, BLOCK=io_block, inv_temp=inv_temp, num_warps=8,
+    )
+
+
 def fused_topk_topp(logits, *, k, p, temperature=1.0, out=None):
     """Fused Triton implementation of the contract. See _kernels below."""
     _validate(logits, k, p, temperature, out)
@@ -278,6 +520,10 @@ def fused_topk_topp(logits, *, k, p, temperature=1.0, out=None):
     if out is None:
         out = torch.empty((B, V), dtype=torch.float32, device=logits.device)
     if B == 0:
+        return out
+
+    if _sampling_path(logits) == "hist":
+        _hist_topk_topp(logits, out, k=k, p=p, temperature=temperature)
         return out
 
     # Keeping BLOCK moderate bounds register pressure; rows are streamed repeatedly.

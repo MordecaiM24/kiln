@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from kiln.sampling import fused_topk_topp, reference_topk_topp
+from kiln.sampling import _sampling_path, fused_topk_topp, reference_topk_topp
 
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -9,6 +9,13 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _comparison_cases = 0
 _fallback_cases = 0
+
+
+@pytest.fixture(autouse=True, params=("sweep", "hist"))
+def sampling_path(request, monkeypatch):
+    """Run the complete suite through both call-time path selections."""
+    monkeypatch.setenv("KILN_SAMPLING_PATH", request.param)
+    return request.param
 
 
 def _kept(x):
@@ -150,8 +157,9 @@ def test_strided_out_sentinel():
     _assert_probabilities_match(logits, out, k=50, p=0.9, temperature=1.0)
 
 
-def test_determinism():
-    logits = torch.randn((3, 4096), device="cuda", dtype=torch.float32)
+def test_determinism(sampling_path):
+    logits = torch.randn((3, 32768), device="cuda", dtype=torch.float16)
+    assert _sampling_path(logits) == sampling_path
     first = fused_topk_topp(logits, k=500, p=0.9, temperature=0.8)
     second = fused_topk_topp(logits, k=500, p=0.9, temperature=0.8)
     assert torch.equal(first.view(torch.int32), second.view(torch.int32))
@@ -163,9 +171,18 @@ def test_empty_batch():
     assert result.shape == (0, 17) and result.dtype == torch.float32
 
 
-def test_validation_errors():
+def test_validation_errors(sampling_path, monkeypatch):
     good = torch.randn((2, 17), device="cuda", dtype=torch.float16)
     bad_stride = torch.randn((2, 34), device="cuda", dtype=torch.float16)[:, ::2]
+    if sampling_path == "hist":
+        # A forced path is still a safe request: unsupported dtypes and vocab
+        # sizes explicitly fall back rather than silently skipping coverage.
+        assert _sampling_path(good) == "sweep"
+        assert _sampling_path(good.float()) == "sweep"
+    with monkeypatch.context() as env:
+        env.setenv("KILN_SAMPLING_PATH", "invalid")
+        with pytest.raises(ValueError, match="KILN_SAMPLING_PATH"):
+            fused_topk_topp(good, k=1, p=1.0)
 
     invalid_calls = (
         lambda: fused_topk_topp([1.0], k=1, p=1.0),
