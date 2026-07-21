@@ -183,8 +183,14 @@ def _run_do_bench(fn, grad_to_none=None):
         fn, warmup=25, rep=200, return_mode="all", grad_to_none=grad_to_none
     )
     if len(raw) < 100:
+        # Slow case: scale the measurement window so we always collect >= 100
+        # iterations (project timing rule), capped to keep the suite bounded.
+        import statistics
+
+        est_ms = statistics.median(raw)
+        rep = min(int(est_ms * 120) + 100, 60_000)
         raw = do_bench(
-            fn, warmup=25, rep=500, return_mode="all", grad_to_none=grad_to_none
+            fn, warmup=25, rep=rep, return_mode="all", grad_to_none=grad_to_none
         )
     return [float(x) for x in raw]
 
@@ -318,6 +324,9 @@ def _build_rmsnorm_provider(provider, case, x, w):
         return fn, [x, w], None, None
 
     if provider == "torch_compile":
+        # Fresh dynamo state per case: reusing one compiled callable across the
+        # whole shape matrix trips the recompile limit under fullgraph=True.
+        torch._dynamo.reset()
         compiled = torch.compile(_eager_rmsnorm, fullgraph=True)
         if case["mode"] == "fwd":
 
@@ -424,6 +433,8 @@ def _build_sampling_provider(provider, case, logits):
         return fn, None
 
     if provider == "torch_compile_hf_chain":
+        # Fresh dynamo state per case; see the rmsnorm torch_compile note.
+        torch._dynamo.reset()
         compiled = torch.compile(hf_chain_topk_topp, fullgraph=True, dynamic=False)
 
         def fn():
