@@ -100,6 +100,11 @@ def _sampling_kernel(
 ):
     row = tl.program_id(0)
     offsets = tl.arange(0, BLOCK)
+    # Iteration-1 evidence (prof/notes.md, prof/subset_iter1.md): the 16-way
+    # multi-pivot sweep costs ~5x a bisection sweep, so it only pays off when it
+    # replaces a 32-iteration search (fp32 keys). 16-bit keys keep the bisection.
+    MULTI_PIVOT: tl.constexpr = NBITS == 32
+    search_iters: tl.constexpr = 8
 
     # Pass A: the softmax shift and the integer-key search interval.
     s_max = float("-inf")
@@ -120,18 +125,56 @@ def _sampling_kernel(
     if k < V:
         lo = key_min.to(tl.int64)
         hi = key_max.to(tl.int64)
-        for _ in range(NBITS):
-            mid = (lo + hi + 1) // 2
-            count = 0
-            for start in range(0, V, BLOCK):
-                cols = start + offsets
-                mask = cols < V
-                x = tl.load(X + row * stride_x + cols, mask=mask, other=float("-inf"))
-                key = _sortable_key(x, NBITS).to(tl.int64)
-                count += tl.sum((mask & (key >= mid)).to(tl.int32), axis=0)
-            take_mid = count >= k
-            lo = tl.where(take_mid, mid, lo)
-            hi = tl.where(take_mid, hi, mid - 1)
+        if MULTI_PIVOT:
+            for _ in range(search_iters):
+                if lo < hi:
+                    width = hi - lo + 1
+                    counts = tl.zeros((16,), tl.int32)
+                    for start in range(0, V, BLOCK):
+                        cols = start + offsets
+                        mask = cols < V
+                        x = tl.load(
+                            X + row * stride_x + cols,
+                            mask=mask,
+                            other=float("-inf"),
+                        )
+                        key = _sortable_key(x, NBITS).to(tl.int64)
+                        valid = mask & (key >= lo)
+                        bucket = ((key - lo) * 16) // width
+                        bucket = tl.minimum(bucket, 15)
+                        bucket = tl.where(valid, bucket, -1).to(tl.int32)
+                        counts += tl.histogram(bucket, 16)
+
+                    suffix = tl.sum(counts, axis=0)
+                    chosen = 0
+                    for j in tl.static_range(16):
+                        chosen = tl.where(suffix >= k, j, chosen)
+                        count_j = tl.sum(tl.where(tl.arange(0, 16) == j, counts, 0), axis=0)
+                        suffix -= count_j
+
+                    # bucket j begins at ceil(j * width / 16).  Using ceil here is
+                    # required by the floor division in bucket above.
+                    old_lo = lo
+                    lo = old_lo + (chosen * width + 15) // 16
+                    hi = old_lo + ((chosen + 1) * width + 15) // 16 - 1
+        else:
+            for _ in range(NBITS):
+                if lo < hi:
+                    mid = (lo + hi + 1) // 2
+                    count = 0
+                    for start in range(0, V, BLOCK):
+                        cols = start + offsets
+                        mask = cols < V
+                        x = tl.load(
+                            X + row * stride_x + cols,
+                            mask=mask,
+                            other=float("-inf"),
+                        )
+                        key = _sortable_key(x, NBITS).to(tl.int64)
+                        count += tl.sum((mask & (key >= mid)).to(tl.int32), axis=0)
+                    take_mid = count >= k
+                    lo = tl.where(take_mid, mid, lo)
+                    hi = tl.where(take_mid, hi, mid - 1)
         topk_key = lo
 
     # Unnormalized top-k mass. The global row maximum is always in the top-k set.
@@ -150,21 +193,61 @@ def _sampling_kernel(
         target = p * z_k
         lo = topk_key
         hi = key_max.to(tl.int64)
-        for _ in range(NBITS):
-            mid = (lo + hi + 1) // 2
-            mass = 0.0
-            for start in range(0, V, BLOCK):
-                cols = start + offsets
-                mask = cols < V
-                x = tl.load(X + row * stride_x + cols, mask=mask, other=float("-inf"))
-                key = _sortable_key(x, NBITS).to(tl.int64)
-                s = x.to(tl.float32) * inv_temp
-                mass += tl.sum(
-                    tl.where(mask & (key >= mid), tl.exp(s - s_max), 0.0), axis=0
-                )
-            take_mid = mass >= target
-            lo = tl.where(take_mid, mid, lo)
-            hi = tl.where(take_mid, hi, mid - 1)
+        if MULTI_PIVOT:
+            bin_ids = tl.arange(0, 16)
+            for _ in range(search_iters):
+                if lo < hi:
+                    width = hi - lo + 1
+                    masses = tl.zeros((16,), tl.float32)
+                    for start in range(0, V, BLOCK):
+                        cols = start + offsets
+                        mask = cols < V
+                        x = tl.load(
+                            X + row * stride_x + cols,
+                            mask=mask,
+                            other=float("-inf"),
+                        )
+                        key = _sortable_key(x, NBITS).to(tl.int64)
+                        s = x.to(tl.float32) * inv_temp
+                        valid = mask & (key >= lo)
+                        bucket = ((key - lo) * 16) // width
+                        bucket = tl.minimum(bucket, 15)
+                        e = tl.where(valid, tl.exp(s - s_max), 0.0)
+                        for j in tl.static_range(16):
+                            mass_j = tl.sum(tl.where(bucket == j, e, 0.0), axis=0)
+                            masses += tl.where(bin_ids == j, mass_j, 0.0)
+
+                    suffix = tl.sum(masses, axis=0)
+                    chosen = 0
+                    for j in tl.static_range(16):
+                        chosen = tl.where(suffix >= target, j, chosen)
+                        mass_j = tl.sum(tl.where(bin_ids == j, masses, 0.0), axis=0)
+                        suffix -= mass_j
+
+                    old_lo = lo
+                    lo = old_lo + (chosen * width + 15) // 16
+                    hi = old_lo + ((chosen + 1) * width + 15) // 16 - 1
+        else:
+            for _ in range(NBITS):
+                if lo < hi:
+                    mid = (lo + hi + 1) // 2
+                    mass = 0.0
+                    for start in range(0, V, BLOCK):
+                        cols = start + offsets
+                        mask = cols < V
+                        x = tl.load(
+                            X + row * stride_x + cols,
+                            mask=mask,
+                            other=float("-inf"),
+                        )
+                        key = _sortable_key(x, NBITS).to(tl.int64)
+                        s = x.to(tl.float32) * inv_temp
+                        mass += tl.sum(
+                            tl.where(mask & (key >= mid), tl.exp(s - s_max), 0.0), axis=0
+                        )
+                    take_mid = mass >= target
+                    lo = tl.where(take_mid, mid, lo)
+                    hi = tl.where(take_mid, hi, mid - 1)
         final_key = lo
 
     z_final = 0.0
