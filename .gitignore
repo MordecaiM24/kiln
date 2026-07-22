@@ -1,8 +1,15 @@
+# Python
 .venv/
 __pycache__/
 *.pyc
 .pytest_cache/
 *.egg-info/
+dist/
+build/
 uv.lock
-prof/*.ncu-rep
+
+# Nsight Compute reports (large; regenerate with bench/profile_sampling.py)
+*.ncu-rep
+
+# OS
 .DS_Store

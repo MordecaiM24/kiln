@@ -1,11 +1,21 @@
-"""Fused top-k / top-p sampling.
+"""Fused top-k / top-p sampling in Triton.
 
-Semantics are frozen in docs/sampling_contract.md. `reference_topk_topp` is the
-contract's executable form: the Triton kernel must match it (up to the documented
-boundary-tie tolerance). `hf_chain_topk_topp` is the HuggingFace-style eager chain
-used as a performance baseline only — its tie-breaking differs from the contract.
+The operator's semantics are specified in docs/sampling_contract.md. Three
+callables live here:
+
+* `fused_topk_topp`     the Triton implementation (two internal code paths,
+                        chosen per call by `_sampling_path`)
+* `reference_topk_topp` a plain-PyTorch implementation of the same contract,
+                        used as the oracle in tests
+* `hf_chain_topk_topp`  the HuggingFace-style eager chain (topk, sort, cumsum,
+                        softmax) used as a performance baseline only; its
+                        tie-breaking differs from the contract
+
+The design rationale and measurements behind the two code paths are written up
+in docs/sampling_optimization.md.
 """
 
+import math
 import os
 
 import torch
@@ -26,7 +36,6 @@ def _validate(logits, k, p, temperature, out=None):
         raise ValueError("logits must be contiguous along the vocab dimension")
     if not isinstance(k, int) or k < 1:
         raise ValueError(f"k must be an int >= 1, got {k!r}")
-    import math
     if not (0.0 < float(p) <= 1.0):
         raise ValueError(f"p must be in (0, 1], got {p!r}")
     if not (float(temperature) > 0.0 and math.isfinite(float(temperature))):
@@ -294,9 +303,9 @@ def _sampling_kernel(
 ):
     row = tl.program_id(0)
     offsets = tl.arange(0, BLOCK)
-    # Iteration-1 evidence (prof/notes.md, prof/subset_iter1.md): the 16-way
-    # multi-pivot sweep costs ~5x a bisection sweep, so it only pays off when it
-    # replaces a 32-iteration search (fp32 keys). 16-bit keys keep the bisection.
+    # A 16-way multi-pivot sweep costs ~5x a bisection sweep, so it only pays
+    # off when it replaces a 32-iteration search (fp32 keys). 16-bit keys keep
+    # the plain bisection. Measurements: docs/sampling_optimization.md, iteration 1.
     MULTI_PIVOT: tl.constexpr = NBITS == 32
     search_iters: tl.constexpr = 8
 
@@ -466,7 +475,12 @@ def _sampling_kernel(
 
 
 def _sampling_path(logits, path=None):
-    """Resolve the call-time path override, retaining safe fallbacks."""
+    """Choose "sweep" or "hist" for this call.
+
+    `path` (or the KILN_SAMPLING_PATH environment variable) may force a path;
+    "auto" picks by measured crossover. The histogram path only exists for
+    16-bit dtypes and V >= 8192, so a forced "hist" falls back to "sweep" there.
+    """
     if path is None:
         path = os.environ.get("KILN_SAMPLING_PATH", "auto")
     if path not in {"auto", "sweep", "hist"}:
@@ -477,12 +491,11 @@ def _sampling_path(logits, path=None):
         return "sweep"
     if path == "hist":
         return "hist"
-    # Piecewise envelope from measured crossovers after the iteration-3 scan
-    # fix (prof/notes.md): the histogram path has a ~40 us floor and cost
-    # roughly linear in B*V, while the sweep grows with V but is flat in B
-    # until the SMs fill. Marginal-win boundaries are excluded on purpose:
-    # measured wins at (V=32768, B=64) and (V=131072, B=192) were within ~5%,
-    # so the cutoffs sit one step inside.
+    # Piecewise envelope from measured crossovers (docs/sampling_optimization.md,
+    # iteration 3): the histogram path has a ~40 us floor and a cost roughly
+    # linear in B*V, while the sweep grows with V but is flat in B until the
+    # SMs fill. Marginal wins are excluded on purpose: (V=32768, B=64) and
+    # (V=131072, B=192) won by under ~5%, so the cutoffs sit one step inside.
     if V >= 98304:
         b_max = 128
     elif V >= 65536:
@@ -538,7 +551,12 @@ def _hist_topk_topp(logits, out, *, k, p, temperature):
 
 
 def fused_topk_topp(logits, *, k, p, temperature=1.0, out=None):
-    """Fused Triton implementation of the contract. See _kernels below."""
+    """Temperature-scale, top-k filter, softmax, top-p filter, renormalize.
+
+    Returns float32 probabilities of shape [B, V]; filtered entries are exactly
+    0.0 and each row sums to 1. See docs/sampling_contract.md for the precise
+    semantics (including tie handling) and validation rules.
+    """
     _validate(logits, k, p, temperature, out)
     B, V = logits.shape
     if out is None:

@@ -4,7 +4,7 @@ import torch
 from kiln.rmsnorm import MAX_FUSED_N, rmsnorm
 
 
-# Predeclared before the first test run. Backward tolerances are exactly 2x forward.
+# Fixed before the first test run and never loosened. Backward tolerances are exactly 2x forward.
 FWD_TOL = {
     torch.float16: (1e-3, 1e-3),
     torch.bfloat16: (1e-2, 1e-2),

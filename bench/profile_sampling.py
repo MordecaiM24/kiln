@@ -1,11 +1,14 @@
-"""Target for Nsight Compute profiling of the fused sampling kernel.
+"""Launch target for profiling the fused sampling kernel with Nsight Compute.
 
-Usage (on the GPU host):
+Example (on a CUDA host with `ncu` installed):
+
     ncu --set full -k "regex:_sampling_kernel" --launch-count 3 \
-        --export prof/sampling_B32 -f .venv/bin/python prof/profile_sampling.py --B 32
+        --export bench/sampling_B32 -f \
+        .venv/bin/python bench/profile_sampling.py --B 32
 
-Runs a few launches of the headline case so ncu can attach to steady-state
-replays (first launches include compilation).
+Runs a handful of launches of one case so ncu can capture steady-state replays
+(the first launch includes Triton compilation). Use `-k "regex:_hist_"` to
+profile the histogram path's kernels instead.
 """
 
 import argparse

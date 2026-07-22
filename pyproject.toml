@@ -1,18 +1,29 @@
 [project]
 name = "kiln"
 version = "0.1.0"
-description = "Small, rigorous Triton kernels: RMSNorm (fwd+bwd) and fused top-k/top-p sampling, benchmarked honestly."
+description = "Two Triton kernels (RMSNorm fwd+bwd, fused top-k/top-p sampling) and a CUDA port, benchmarked and profiled on an NVIDIA L40S."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "numpy>=2.5.1",
     "torch>=2.13.0",
+]
+
+[dependency-groups]
+# `uv sync` installs every group listed under [tool.uv] default-groups, so
+# `uv sync && uv run pytest` works with no extra flags.
+dev = [
     "pytest>=9.0",
+    "ninja>=1.11",           # JIT build of the CUDA extension (tests/test_rmsnorm_cuda.py)
+]
+bench = [
+    "numpy>=2.5.1",
     "pyyaml>=6.0",
     "matplotlib>=3.9",
-    "liger-kernel>=0.5",
-    "ninja>=1.11",
+    "liger-kernel>=0.5",     # RMSNorm baseline
 ]
+
+[tool.uv]
+default-groups = ["dev", "bench"]
 
 [build-system]
 requires = ["hatchling"]

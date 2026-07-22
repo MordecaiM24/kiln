@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
-"""Run predeclared GPU benchmarks and write raw JSON results."""
+"""Run the benchmark matrix in bench/cases.yaml and write raw JSON results.
+
+Each (suite, case, provider) produces one record containing every raw
+per-iteration timing, so medians and IQRs can be recomputed later. Providers
+that are unavailable or crash are recorded with a status and error string
+rather than dropped. See docs/benchmarking.md.
+"""
 
 import argparse
 import json
+import os
 import socket
 import subprocess
 import time
@@ -36,10 +43,8 @@ class UnsupportedProvider(Exception):
 
 
 def _git_short():
-    # The remote bench copy is rsynced without .git; KILN_GIT_COMMIT carries the
-    # commit stamped at sync time.
-    import os
-
+    # KILN_GIT_COMMIT lets a checkout without .git (e.g. an rsync'd copy on the
+    # GPU host) still stamp results with the commit they came from.
     override = os.environ.get("KILN_GIT_COMMIT")
     if override:
         return override[:8]
@@ -53,8 +58,6 @@ def _git_short():
 
 
 def _git_full():
-    import os
-
     override = os.environ.get("KILN_GIT_COMMIT")
     if override:
         return override
@@ -183,8 +186,8 @@ def _run_do_bench(fn, grad_to_none=None):
         fn, warmup=25, rep=200, return_mode="all", grad_to_none=grad_to_none
     )
     if len(raw) < 100:
-        # Slow case: scale the measurement window so we always collect >= 100
-        # iterations (project timing rule), capped to keep the suite bounded.
+        # Slow case: widen the measurement window so every record has at least
+        # 100 iterations, capped to keep the suite bounded.
         import statistics
 
         est_ms = statistics.median(raw)
@@ -512,17 +515,14 @@ def run_sampling_provider(provider, case, device):
 
 
 def _warm_process_state(device):
-    """Best-effort state normalization before any timing.
+    """Best-effort normalization of process state before any timing.
 
-    Large memory-bound kernels show a reproducible bimodality under do_bench
-    (~104 vs ~71 us for a 4096x4096 fp16 RMSNorm) that follows the process's
-    allocation history, not the kernel: interleaved A/B runs put kiln and
-    Liger RMSNorm fwd at parity in BOTH modes, while this harness's fixed
-    per-case provider order can land different providers in different modes.
-    This warmup did NOT eliminate the artifact (see prof/notes.md,
-    "provider-order bias"); it is kept for uniformity, and cross-provider fwd
-    conclusions at bandwidth-bound shapes are drawn from interleaved A/B runs
-    rather than from single-order harness records.
+    Large memory-bound kernels on the L40S show a reproducible bimodality under
+    do_bench (about 104 vs 71 us for a 4096x4096 fp16 RMSNorm) that follows the
+    process's allocation history rather than the kernel. This warm-up did not
+    remove the effect; it is kept so every run starts from the same state. The
+    investigation and its consequences for reading the RMSNorm forward numbers
+    are in docs/benchmarking.md ("Provider-order bias").
     """
     torch._dynamo.reset()
     f = torch.compile(lambda t: t * 2.0 + 1.0, fullgraph=True)
@@ -575,7 +575,8 @@ def main():
         else:
             cases = expand_sampling_cases(suite_cfg, smoke=args.smoke)
         records = run_suite(suite_name, cases, suite_cfg["providers"], device)
-        out_path = args.outdir / f"{suite_name}_{env['git_short']}_{env['hostname']}.json"
+        stamp = env["timestamp"][:19].replace(":", "").replace("-", "")
+        out_path = args.outdir / f"{suite_name}_{env['git_short']}_{stamp}.json"
         with out_path.open("w") as f:
             json.dump({"env": env, "records": records}, f, indent=2)
         print(f"wrote {out_path} ({len(records)} records)")
