@@ -8,23 +8,6 @@ of this repo is *why* that works, measured honestly: at those shapes the batch's
 logits fit in the L40S's 96 MB L2, so repeated sweeps are nearly free, while the
 baselines pay for a full 128k-column sort.
 
-Kiln is a small, deliberately-scoped GPU systems project: two Triton kernels, a
-predeclared benchmark harness, an Nsight Compute deep-dive with one
-profile-driven optimization loop (including a measured failure), and an upstream
-contribution to Liger-Kernel. It is not an inference server.
-
-## What's here
-
-| piece | where | status |
-|---|---|---|
-| RMSNorm fwd+bwd (Triton) | `src/kiln/rmsnorm.py` | 110 tests green |
-| Fused top-k/top-p sampling (Triton, headline; two dispatch paths) | `src/kiln/sampling.py` | 54 property tests green |
-| CUDA C++ RMSNorm port (custom op, Tier 3) | `src/kiln/csrc/`, `src/kiln/rmsnorm_cuda.py` | 115 tests, opcheck + sanitizer clean |
-| Frozen operator contract (semantics, ties, errors) | `docs/sampling_contract.md` | committed before optimization |
-| Predeclared benchmark matrix | `bench/cases.yaml` | committed before tuning |
-| Harness + plots (raw JSON replicates committed) | `bench/` | one command, below |
-| Profiling evidence + optimization log | `prof/notes.md` | ncu before/after, failed ideas kept |
-| Upstream PR (Liger-Kernel) | local branch, pending review | see below |
 
 **Contract-first:** the sampling op's semantics were frozen in
 `docs/sampling_contract.md` before any tuning — including a deliberate,
@@ -67,11 +50,10 @@ atomics, bit-identical tie semantics.
 Across the full predeclared core fp16 matrix, kiln now wins every case against
 both baselines (1.4–16.4× vs eager) except three p=1.0 cases at 0.95–0.97×
 (parity) — and B=1/V=128k, v1's worst loss at 0.25×, is now a 3.2× win over
-`torch.compile`. **What still doesn't win, and why (kept per protocol):**
+`torch.compile`. **What still doesn't win, and why:**
 
 - **p=1.0 near-parity (0.95–0.97×):** with top-p disabled the baselines skip
-  their sort entirely, so both sides are close to a pure softmax (labeled per
-  the no-silent-work-differences rule).
+  their sort entirely, so both sides are close to a pure softmax.
 - **k=V, p=1.0 stress case (0.42× vs compile):** both filters are no-ops, so
   the whole op *is* a softmax — inductor's single fused softmax kernel is
   simply the right tool for that degenerate case.
@@ -104,7 +86,7 @@ two-stage dw. Left as-is — RMSNorm is the verification tier, and Gate C says
 polish doesn't jump the queue. Otherwise the expected honest outcome: 6–12×
 over eager, parity with `torch.compile`.
 
-## Tier 3 — CUDA C++ port of RMSNorm
+## CUDA C++ port of RMSNorm
 
 `kiln::rmsnorm_cuda`: fwd+bwd CUDA kernels registered via `TORCH_LIBRARY` with
 autograd and FakeTensor support. 115 tests (same predeclared tolerances as the
@@ -136,7 +118,7 @@ waiting on L2 with almost no warps to hide behind. The batch's logits (8 MB)
 live in L2 — which is also exactly why re-reading them ~20× can still beat a
 sort. Hypothesis: runtime ∝ number of serial sweeps.
 
-**Iteration 1 (kept only where the evidence said so):** replace both bisections
+**Iteration 1:** replace both bisections
 with a 16-way multi-pivot search (4 sweeps instead of 16 for fp16; 8 instead of
 32 for fp32), buckets via `tl.histogram` for counts and masked reductions for
 top-p mass. Result: **fp32 2.75× faster (12.0 → 4.4 ms)** — but **fp16 got
@@ -149,7 +131,7 @@ another 1.2–1.35× on fp16. Post-change ncu: duration 1.63 → 1.28 ms on the
 profiled shape, DRAM% and occupancy essentially unchanged — the win came
 entirely from removing serial sweeps, as predicted.
 
-**Iteration 2 (the low-hanging fruit that worked):** the B=1 occupancy cliff
+**Iteration 2:** the B=1 occupancy cliff
 fell to an exact keyspace-histogram path — build the full 65,536-bin histogram
 of 16-bit sortable keys with B×32 programs (int32 atomics only), then both
 thresholds come from two tiny suffix scans, exactly, because each bin *is* one
@@ -157,7 +139,7 @@ dtype value (per-bin mass = `count × exp(value)`; a literal weighted-histogram
 variant measured 2.7× slower than the sweep and is recorded as a failed idea).
 B=1, V=128k: 573 → 204 µs. Both paths run the full property suite (54 tests).
 
-**Iteration 3 (profile the new path too):** per-kernel ncu showed one kernel —
+**Iteration 3:** per-kernel ncu showed one kernel —
 the histogram threshold scan — at 453 µs while everything else totaled ~40 µs:
 it walked 256 blocks with a serially dependent accumulator, one L2 round trip
 per block. Restructuring it twice (independent block totals + vectorized
@@ -166,19 +148,6 @@ reverse-cumsum suffix logic: 204 → 136 µs; then reading the histogram as four
 went from this project's worst loss (0.25× vs compile in v1) to a 3.2× win.
 The hist/sweep dispatch envelope was then re-measured from scratch (sweep still
 wins at V=8k and B≥~192; marginal boundaries excluded).
-
-**A benchmarking pitfall we caught instead of shipping:** the harness's fixed
-provider order produced a reproducible fake 1.5× "Liger fwd win" — large
-memory-bound kernels here are bimodal (~104 vs ~71 µs) with process allocation
-history, and interleaved A/B shows the kernels at parity in both modes (the
-fast mode beats the write-drain roofline, so it isn't a kernel-speed number at
-all). Documented in `prof/notes.md`; biased raw records preserved and labeled
-rather than scrubbed. Full log with all failed ideas: `prof/notes.md`.
-
-**Hardware honesty:** all absolute numbers are from an L40S (GDDR6, ~864 GB/s,
-96 MB L2). A100/H100-class parts with HBM will shift the absolute µs and the
-L2-residency crossover points; the *shape* of the conclusions (sort-free wins at
-batch, occupancy cliff at B=1) should transfer.
 
 ## Reproduce
 
@@ -200,11 +169,3 @@ overflow geometry — the gap that let the bug ship. Prepared (local branch
 public): a memory-gated regression test allocating the true E=512/H=4096/I=1024
 bf16 weights (max element offset 2³²−1), routing all tokens to the final
 experts, validated on the L40S in 29 s.
-
-## Backlog (visible, deliberately not scheduled)
-
-In-place backward + block-row scheme for RMSNorm bwd (close the real 1.17×
-Liger gap); root-cause the allocation-history timing bimodality; extend the
-exact-histogram idea to fp32 (two-level 16+16-bit radix); mid-batch hist/sweep
-hybrid (split rows across both paths); CUDA-port backward optimization pass;
-single-token decode attention vs FlashInfer.
